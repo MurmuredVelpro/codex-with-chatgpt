@@ -319,11 +319,23 @@ commands (both are cheap / cached; never mention them unless an update exists):
    If already allowlisted, this is a no-op and does not trigger elevation.
 
 - `{ "updateAvailable": false }` → continue silently. Never mention the check.
-- `{ "updateAvailable": true }` → tell the user one line:
+- `{ "updateAvailable": true, "manualUpdateRequired": true }` → tell the user exactly:
+  "检测到上游更新；当前为定制分支，需要手动同步，上游更新暂未自动应用。"
+  Continue the original task. Do NOT run the automatic update workflow.
+- `{ "updateAvailable": true, "manualUpdateRequired": false }` → tell the user one line:
   "检测到 Codex with ChatGPT 有新版本，我先更新一下（约 1 分钟），随后继续你的任务。"
   Then run the update workflow below, and CONTINUE the original task afterwards.
 
+The update-check JSON also uses `updateSource` / `remote` (`origin` or
+`upstream`) and `customizedFork` (true when an upstream remote exists). A
+customized fork reports new upstream commits with `manualUpdateRequired: true`;
+it never treats local custom commits as remote updates.
+
 ## Workflow: update（"更新 Codex with ChatGPT"，or triggered by the daily check）
+
+This workflow is only for `manualUpdateRequired: false`. A customized fork
+must never auto-pull, merge, or rebase here; report the manual-sync message and
+continue the original task.
 
 Inside the checkout directory (see Locations):
 
