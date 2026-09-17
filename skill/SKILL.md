@@ -120,7 +120,14 @@ detaches the CDP session and drops the tab out of the Playwright-managed group.
 Tools: `browser_tabs`, `browser_navigate`, `browser_snapshot`, `browser_find`,
 `browser_type`, `browser_click`, `browser_wait_for`, plus `browser_evaluate`,
 `browser_network_requests`, and `browser_console_messages` for read-only
-diagnostics only.
+diagnostics only. Never use `browser_run_code_unsafe`, never modify the DOM,
+and never trigger clicks through JavaScript.
+
+Observed fallback anchors, not permanent identifiers: Chinese UI text
+`与 ChatGPT 聊天`, `聊天 / 工作`, `停止回答`, `ChatGPT 说：`, `回复操作`.
+Prefer semantic role, stable testid/id (known send-button), and message
+structure. If the target cannot be uniquely identified, stop and report; never
+guess a selector and never click a similar element.
 
 1. **Tabs.** A tab has no stable id — only an index and a current tab.
    At the start of every batch of browser actions:
@@ -135,6 +142,14 @@ diagnostics only.
    tab fails with a transient tab-edit error (e.g. "Tabs cannot be edited
    right now"), retry that same step at most once.
 
+   Do not treat a tab as the target C2C tab merely because it is current or
+   its URL contains `chatgpt.com`. Locate the target in this order:
+   1. the canonical conversation URL already saved for the current C2C thread
+      or workspace,
+   2. the current workspace's Project URL,
+   3. only when no saved conversation exists, create a new managed tab.
+   Never reuse another workspace's ChatGPT tab.
+
 2. **Preflight before any C2C control message.** In order:
    1. `c2c doctor -w <workspace> --json`
    2. `c2c session -w <workspace> --json`
@@ -148,10 +163,13 @@ diagnostics only.
       and the current surface is **Chat**, not Work.
    Send nothing until every check passes. If any check fails, stop and report.
 
-3. **Foreground + standby.** Bring the C2C Edge window to the front for
-   first-time setup and while the user watches. Do not close the tab between
-   turns — leave it open as standby so default turn cleanup cannot drop it.
-   There is no browser-level handoff or deliverable marking any more:
+3. **Managed tab + standby.** Always `browser_tabs` select the target managed
+   tab before browser automation. After the select, re-run `browser_find` /
+   `browser_snapshot`; refs from before the select are invalid. Do not assume
+   Playwright can activate the Windows OS window. Whether the user can see the
+   Edge window is not a requirement for protocol correctness. Do not close the
+   tab between turns — leave it open as standby so default turn cleanup cannot
+   drop it. There is no browser-level handoff or deliverable marking any more:
    `markHandoff()` and `markDeliverable()` are gone, and there is no Playwright
    equivalent. Standby semantics live in the C2C protocol message, the local
    checkpoint, and the conversation URL.
@@ -186,14 +204,17 @@ diagnostics only.
    auxiliary only. Never use `browser_evaluate` to click — a JS click is
    forbidden. Never resend because the reply is slow.
 
-7. **One conversation, Chat mode.** The first ChatGPT chat is the C2C
-   conversation. Chat and Work (聊天 / 工作) are separate: a Work conversation
-   cannot become Chat. On every NEW conversation, read the Chat/Work switcher —
-   a radiogroup named `选择聊天界面` with radios `聊天` and `工作` — and confirm
-   **聊天 (Chat)** is selected before the boot prompt. If it is Work, stop and
-   report; do not auto-continue there. Switch to a new Chat conversation
-   (HANDOFF). If no switcher is visible, do not hunt menus; continue.
-   Send the boot prompt and the workspace_info check in that Chat conversation.
+7. **One conversation, Chat mode.** C2C runs only in Chat. Chat and Work
+   (聊天 / 工作) are separate surfaces; a Work conversation cannot become a C2C
+   Chat. On every new or restored conversation, read the Chat/Work switcher when
+   present and confirm **聊天 (Chat)** is selected before any C2C control
+   message. If it is Work, stop browser automation immediately, tell the user to
+   switch the C2C page to Chat, and wait for user confirmation. After the user
+   confirms, re-run the full preflight. First version: never auto-switch
+   Work → Chat and never send HANDOFF to a Work conversation. If no switcher is
+   visible, do not hunt menus; continue only when the surface is otherwise
+   confirmed Chat. Send the boot prompt and the workspace_info check in that
+   Chat conversation.
    Confirm the reply names the current workspace **before** saving or replacing
    the session URL. If validation fails, keep the old saved URL. Do not open a
    throwaway verify chat and later another C2C chat.
@@ -211,16 +232,21 @@ diagnostics only.
 8. **Wait for a ChatGPT reply (never hold one long wait).** After you send
    INIT, EXECUTED, the boot prompt, or the workspace_info check, keep the tab
    and stay in this same task. Poll in short cycles — roughly every 3 seconds
-   for the first 15 seconds, then roughly every 10 seconds, up to about 120
-   seconds total. Each poll is one cheap read: `browser_find` /
-   `browser_snapshot`. Do NOT hold one 5-minute wait, do NOT screenshot-poll,
-   and do NOT resend.
+   for the first 15 seconds, then roughly every 10 seconds until 120 seconds.
+   120 seconds is a soft checkpoint, not a hard failure. If generating/stop
+   still exists, the page is healthy, and there is no `Retry` / `重试` / error /
+   `at capacity` signal, continue polling roughly every 20–30 seconds. Stop
+   after 10 minutes total and report timeout; never resend. If generation
+   completes before the deadline, continue normally immediately.
+   Each poll is one cheap read: `browser_find` / `browser_snapshot`. Do NOT
+   hold one long wait, do NOT screenshot-poll, and do NOT resend.
    - still generating → wait again (do not type, do not resend);
    - `STATE: PLAN` / `DONE` / `BLOCKED` / the verify workspace name → read it
      and continue the existing protocol;
    - visible error → repair; do not start a new chat.
-   Generating: the known UI signal is a `button` named `停止回答` (stop). Treat
-   that text as a hint, not a long-term contract — it drifts with locale and UI.
+   `停止回答` (stop) is an observed fallback anchor for generating, not a
+   permanent identifier. `Retry` / `重试` / error / `at capacity` are failure
+   or retry anchors, not completion.
    A reply counts as complete only when ALL of these hold:
    1. an assistant message exists,
    2. its latest body is readable,
@@ -363,8 +389,9 @@ Speak only of 临时地址 / 固定域名 / 登录 Cloudflare.
      `接下来用手动教学配置。一次只需要做一个操作。`
      Do not say 自动配置没有成功.
    - `setupMode: "auto"`: continue with step 5. Keep the two-failure fallback.
-5. Open ChatGPT on the ONE managed tab (see **Browser control**). Bring it
-   to the foreground. Same tab, `browser_navigate` only:
+5. Open ChatGPT on the ONE managed tab (see **Browser control**). Select the
+   target managed tab; do not assume Playwright can activate the Windows OS
+   window. Same tab, `browser_navigate` only:
    - 开发人员模式: skip `https://chatgpt.com/#settings/Security` when
      `developerModeEnabled` is true. Otherwise open it, enable 开发人员模式
      ("Developer mode") if it is off, then `c2c prefs set --developer-mode`.
@@ -382,14 +409,21 @@ Speak only of 临时地址 / 固定域名 / 登录 Cloudflare.
       - Description: `Securely connect ChatGPT to the current Codex workspace for planning and review.`
       - Server URL: the `mcpUrl` from step 3
       - Authentication: OAuth
-     Fill the known form in one script when you can. Then Connect / Authorize.
+     Use only verified high-level Playwright MCP tools for form work:
+     `browser_find`, `browser_type`, `browser_click`, `browser_snapshot`.
+     `browser_evaluate` is read-only diagnostics only. Do not use
+     `browser_run_code_unsafe`, do not modify the DOM, and do not click
+     through JavaScript. After form operations, do one cheap DOM check. Then
+     Connect / Authorize.
      Only then run `c2c pair --json` and type that code. As soon as it shows
      Connected / authorized / pairing accepted, continue — do NOT wait for 8
      tools on this page.
 6. Same tab: open the first C2C chat per **Conversation management**
    (Project collection for a new workspace; `https://chatgpt.com/` only
-   in long-chat). Confirm Chat mode per **Browser control** §7 (if it is Work,
-   open a new Chat conversation instead). Send the boot prompt from
+   in long-chat). Confirm Chat mode per **Browser control** §7. If it is Work,
+   stop browser automation and ask the user to switch the C2C page to Chat;
+   after confirmation, re-run preflight. Never auto-switch Work → Chat and
+   never send HANDOFF to Work. Send the boot prompt from
    `docs/protocol.md` §Boot Prompt, then (same chat) send:
    `Use the "<connectorName>" connector: call workspace_info and read hello-style top-level file. Reply with the workspace name.`
    Confirm the reply matches `workspaceName` (wait per **Browser control** §8).
@@ -478,8 +512,11 @@ ONE ChatGPT conversation per workspace. Same as before.
   plus checkpoint flags from the coding workflow (`--protocol-state`,
   `--waiting-for`, `--goal`, `--next-step`, `--known-issues`, or
   `--clear-checkpoint` on DONE). Do not put logs or diffs in those fields.
-- **Switch it** ONLY when (a) the user asks for a new chat, (b) the current
-  chat visibly lags, or (c) this conversation is Work. Then:
+- **Switch it** ONLY when (a) the user asks for a new chat or (b) the current
+  chat visibly lags. If the current conversation is Work, do not switch
+  automatically: stop browser automation, tell the user to switch that page to
+  Chat, and rerun preflight after confirmation. Never send HANDOFF to Work.
+  Then:
   1. Same managed tab: navigate to `https://chatgpt.com/`, confirm Chat mode
      (**Browser control** §7), then send the boot prompt.
   2. Send a HANDOFF (`docs/protocol.md`) — goal, progress, state, issues,
