@@ -118,7 +118,6 @@ export function browserLeaseFile(workspaceId: string): string {
 export function browserLeaseLockFile(workspaceId: string): string {
   return path.join(getStateDir(), "browser-leases", `${workspaceId}.lock`);
 }
-
 function missingState(): BrowserLeaseStateV1 {
   return {
     version: 1,
@@ -249,13 +248,24 @@ function writeLeaseStateAtomic(file: string, state: BrowserLeaseStateV1): void {
   }
 }
 
+/**
+ * Copy the corrupt canonical state to a quarantine sibling and leave the
+ * canonical file in place. `takeBrowserControl` then replaces the canonical
+ * file with an atomic temp->rename write. If that replacement fails, status
+ * still observes the original corrupt bytes and fails closed with
+ * STATE_CORRUPT instead of treating a missing file as available.
+ */
 function quarantineCorruptState(file: string): string {
   const target = `${file}.corrupt-${Date.now()}-${randomUUID()}`;
   try {
-    fs.renameSync(file, target);
+    fs.copyFileSync(file, target, fs.constants.COPYFILE_EXCL);
   } catch (error) {
-    if (errorCode(error) === "ENOENT") return target;
     throw new BrowserLeaseError("STATE_IO", `cannot quarantine corrupt browser lease state: ${describeError(error)}`);
+  }
+  try {
+    fs.chmodSync(target, 0o600);
+  } catch {
+    /* best effort on platforms without chmod semantics */
   }
   return target;
 }
@@ -313,6 +323,89 @@ function inspectLeaseLock(lockPath: string): "recoverable" | "wait" {
   return "wait";
 }
 
+/**
+ * Recovery arbitration guard. A single `wx` create serializes stale-lock
+ * reclamation: only the guard creator may unlink a recoverable canonical lock.
+ * The guard is never reclaimed by another contender. If a reclaimer dies
+ * while holding it, later callers wait and then fail closed with LOCK_TIMEOUT
+ * instead of risking a second critical section. It is held only across the
+ * synchronous re-inspect and unlink, never across a Playwright RPC.
+ */
+function reclaimLeaseLock(lockPath: string): "reclaimed" | "busy" | "not-recoverable" {
+  const arbitrationPath = `${lockPath}.recover`;
+  const arbitrationId = randomUUID();
+  let fd: number | null = null;
+  let createdArbitration = false;
+  try {
+    fd = fs.openSync(arbitrationPath, "wx", 0o600);
+    createdArbitration = true;
+    fs.writeSync(fd, JSON.stringify({ arbitrationId, pid: process.pid, createdAt: Date.now() }));
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+  } catch (error) {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+      fd = null;
+    }
+    if (errorCode(error) === "EEXIST") return "busy";
+    if (createdArbitration) {
+      try {
+        fs.unlinkSync(arbitrationPath);
+      } catch {
+        /* ignore */
+      }
+    }
+    throw new BrowserLeaseError("STATE_IO", `cannot create browser lease recovery lock: ${describeError(error)}`);
+  }
+
+  try {
+    // Re-inspect only after winning arbitration. No other contender may
+    // unlink the canonical lock while this guard exists, and a new live lock
+    // cannot be created while the stale canonical path still exists.
+    if (inspectLeaseLock(lockPath) !== "recoverable") return "not-recoverable";
+    try {
+      fs.unlinkSync(lockPath);
+    } catch (error) {
+      if (errorCode(error) !== "ENOENT") {
+        throw new BrowserLeaseError("STATE_IO", `cannot recover browser lease lock: ${describeError(error)}`);
+      }
+    }
+    return "reclaimed";
+  } finally {
+    releaseRecoveryArbitration(arbitrationPath, arbitrationId);
+  }
+}
+
+/**
+ * Remove only the recovery guard created by this process. The id check is
+ * defense in depth; the guard protocol never permits another contender to
+ * replace or remove a live guard.
+ */
+function releaseRecoveryArbitration(arbitrationPath: string, arbitrationId: string): void {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(arbitrationPath, "utf8");
+  } catch {
+    return;
+  }
+  try {
+    const meta = JSON.parse(raw) as { arbitrationId?: unknown };
+    if (meta.arbitrationId !== arbitrationId) return;
+  } catch {
+    return;
+  }
+  try {
+    fs.unlinkSync(arbitrationPath);
+  } catch {
+    /* best effort */
+  }
+}
+
 export function acquireLeaseLock(workspaceId: string): LeaseLockHandle {
   const lockPath = browserLeaseLockFile(workspaceId);
   ensureDir(path.dirname(lockPath));
@@ -349,12 +442,8 @@ export function acquireLeaseLock(workspaceId: string): LeaseLockHandle {
       return { path: lockPath, lockId };
     }
     if (inspectLeaseLock(lockPath) === "recoverable") {
-      try {
-        fs.unlinkSync(lockPath);
-      } catch {
-        /* another writer may have won the race; just retry */
-      }
-      continue;
+      const recovery = reclaimLeaseLock(lockPath);
+      if (recovery !== "busy") continue;
     }
     if (Date.now() >= deadline) {
       throw new BrowserLeaseError("LOCK_TIMEOUT", "timed out waiting for the browser lease lock");

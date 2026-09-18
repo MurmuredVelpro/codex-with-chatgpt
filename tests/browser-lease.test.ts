@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BROWSER_LEASE_DEFAULT_TTL_MS,
   LOCK_CORRUPT_STALE_MS,
@@ -137,6 +137,100 @@ async function runAcquireRace(workspaceId: string): Promise<ChildResult[]> {
   return Promise.all([a.result, b.result]);
 }
 
+interface LockRaceChildResult {
+  ok: boolean;
+  code?: string;
+  pid?: number;
+  criticalCount?: number;
+}
+
+interface LockRaceChild {
+  ready: Promise<void>;
+  result: Promise<LockRaceChildResult>;
+  go: () => void;
+}
+
+/**
+ * Real cross-process contenders for stale-lock recovery. Each child acquires
+ * the raw mutation lock, records a marker while inside the critical section,
+ * holds the lock briefly, and releases it. The parent polls the marker
+ * directory and each child also reports how many markers it observed.
+ */
+function spawnLockRaceChild(workspaceId: string, criticalDir: string): LockRaceChild {
+  const script = [
+    `const { acquireLeaseLock, releaseLeaseLock } = await import(${JSON.stringify(leaseModuleUrl)});`,
+    `const fs = await import("node:fs");`,
+    `const path = await import("node:path");`,
+    `process.stdout.write("READY\\n");`,
+    `await new Promise((resolve) => { process.stdin.once("data", () => resolve(undefined)); process.stdin.resume(); });`,
+    `let lock = null;`,
+    `try {`,
+    `  lock = acquireLeaseLock(process.env.C2C_RACE_WORKSPACE);`,
+    `  const marker = path.join(process.env.C2C_CRITICAL_DIR, "active-" + process.pid);`,
+    `  fs.writeFileSync(marker, "1");`,
+    `  const active = fs.readdirSync(process.env.C2C_CRITICAL_DIR).filter((name) => name.startsWith("active-"));`,
+    `  process.stdout.write("CRITICAL " + JSON.stringify({ pid: process.pid, count: active.length }) + "\\n");`,
+    `  await new Promise((resolve) => setTimeout(resolve, 120));`,
+    `  fs.unlinkSync(marker);`,
+    `  releaseLeaseLock(lock);`,
+    `  process.stdout.write("RESULT " + JSON.stringify({ ok: true, pid: process.pid }) + "\\n");`,
+    `} catch (error) {`,
+    `  const code = error && error.code ? error.code : "UNKNOWN";`,
+    `  process.stdout.write("RESULT " + JSON.stringify({ ok: false, code, pid: process.pid }) + "\\n");`,
+    `}`,
+    `process.exit(0);`,
+  ].join("\n");
+
+  const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
+    cwd: projectRoot,
+    env: { ...process.env, C2C_RACE_WORKSPACE: workspaceId, C2C_CRITICAL_DIR: criticalDir },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  let readyResolve: () => void = () => undefined;
+  let resultResolve: (value: LockRaceChildResult) => void = () => undefined;
+  const ready = new Promise<void>((resolve) => {
+    readyResolve = resolve;
+  });
+  const result = new Promise<LockRaceChildResult>((resolve) => {
+    resultResolve = resolve;
+  });
+
+  let criticalCount: number | undefined;
+  let buffer = "";
+  const handleLine = (line: string): void => {
+    const trimmed = line.trim();
+    if (trimmed === "READY") readyResolve();
+    else if (trimmed.startsWith("CRITICAL ")) {
+      const parsed = JSON.parse(trimmed.slice("CRITICAL ".length)) as { count?: number };
+      criticalCount = parsed.count;
+    } else if (trimmed.startsWith("RESULT ")) {
+      const parsed = JSON.parse(trimmed.slice("RESULT ".length)) as LockRaceChildResult;
+      resultResolve({ ...parsed, criticalCount });
+    }
+  };
+  child.stdout.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString("utf8");
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) handleLine(line);
+  });
+  child.on("exit", (code) => {
+    if (buffer.trim() !== "") handleLine(buffer);
+    resultResolve({ ok: false, code: `EXIT_${code ?? "null"}`, criticalCount });
+  });
+  child.on("error", () => resultResolve({ ok: false, code: "SPAWN_ERROR", criticalCount }));
+  child.stdin.on("error", () => undefined);
+
+  return {
+    ready,
+    result,
+    go: () => {
+      child.stdin.write("go\n");
+    },
+  };
+}
+
 describe("browser lease", () => {
   const dirs: string[] = [];
 
@@ -145,6 +239,7 @@ describe("browser lease", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     for (const dir of dirs) cleanup(dir);
     dirs.length = 0;
     delete process.env.C2C_STATE_DIR;
@@ -332,7 +427,7 @@ describe("browser lease", () => {
     expect(schemaError.code).toBe("STATE_CORRUPT");
   });
 
-  it("19. take quarantines corrupt state and produces a user lease", () => {
+  it("19. take copies corrupt state to quarantine and produces a user lease", () => {
     const file = browserLeaseFile(WORKSPACE);
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, "totally broken");
@@ -446,5 +541,81 @@ describe("browser lease", () => {
       }
     },
     120_000
+  );
+
+  it("26. take keeps canonical corrupt state when the replacement write fails", () => {
+    const file = browserLeaseFile(WORKSPACE);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, "totally broken");
+
+    const renameSpy = vi.spyOn(fs, "renameSync").mockImplementationOnce(() => {
+      throw new Error("injected state rename failure");
+    });
+
+    const error = captureError(() => takeBrowserControl(WORKSPACE));
+    expect(error.code).toBe("STATE_IO");
+    expect(error.exitCode).toBe(1);
+    renameSpy.mockRestore();
+
+    const statusError = captureError(() => getBrowserLeaseStatus(WORKSPACE));
+    expect(statusError.code).toBe("STATE_CORRUPT");
+    expect(statusError.exitCode).toBe(5);
+    expect(fs.readFileSync(file, "utf8")).toBe("totally broken");
+
+    const dir = path.dirname(file);
+    const quarantined = fs.readdirSync(dir).filter((name) => name.startsWith(`${WORKSPACE}.json.corrupt-`));
+    expect(quarantined.length).toBe(1);
+    expect(fs.readFileSync(path.join(dir, quarantined[0]), "utf8")).toBe("totally broken");
+    expect(fs.readdirSync(dir).filter((name) => name.includes(".tmp-"))).toEqual([]);
+  });
+
+  it(
+    "27. two child processes racing stale-lock recovery hold the mutation lock serially (12 rounds)",
+    async () => {
+      const rounds = 12;
+      for (let round = 0; round < rounds; round++) {
+        const workspaceId = `stale-race-${round}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+        const lockPath = browserLeaseLockFile(workspaceId);
+        fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+        fs.writeFileSync(
+          lockPath,
+          JSON.stringify({ lockId: `stale-${round}`, pid: -1, createdAt: Date.now() - 60_000 })
+        );
+
+        const criticalDir = path.join(process.env.C2C_STATE_DIR!, `critical-${round}-${Date.now()}`);
+        fs.mkdirSync(criticalDir, { recursive: true });
+
+        const observed: number[] = [];
+        let polling = true;
+        const poll = (async () => {
+          while (polling) {
+            try {
+              observed.push(fs.readdirSync(criticalDir).filter((name) => name.startsWith("active-")).length);
+            } catch {
+              /* directory is cleaned up only after the loop */
+            }
+            await new Promise((resolve) => setTimeout(resolve, 5));
+          }
+        })();
+
+        const a = spawnLockRaceChild(workspaceId, criticalDir);
+        const b = spawnLockRaceChild(workspaceId, criticalDir);
+        await Promise.all([a.ready, b.ready]);
+        a.go();
+        b.go();
+        const results = await Promise.all([a.result, b.result]);
+        polling = false;
+        await poll;
+
+        expect(results.every((entry) => entry.ok), `round ${round}: ${JSON.stringify(results)}`).toBe(true);
+        for (const entry of results) {
+          expect(entry.criticalCount, `round ${round}: ${JSON.stringify(results)}`).toBe(1);
+        }
+        expect(Math.max(0, ...observed), `round ${round}: observed critical counts ${JSON.stringify(observed)}`).toBeLessThanOrEqual(1);
+        expect(fs.existsSync(`${browserLeaseLockFile(workspaceId)}.recover`), `round ${round}: recovery guard leaked`).toBe(false);
+        expect(fs.existsSync(lockPath), `round ${round}: mutation lock leaked`).toBe(false);
+      }
+    },
+    180_000
   );
 });
