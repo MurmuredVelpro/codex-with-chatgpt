@@ -56,6 +56,16 @@ import {
 import { appendExecutionRecord } from "../execution/records.js";
 import { saveExecutionOutput } from "../execution/output.js";
 import { checkForUpdate, type UpdateCheckResult } from "../update/check.js";
+import {
+  acquireBrowserLease,
+  BrowserLeaseError,
+  getBrowserLeaseStatus,
+  releaseBrowserLease,
+  renewBrowserLease,
+  resumeBrowserControl,
+  takeBrowserControl,
+  type BrowserLeaseView,
+} from "../browser/lease.js";
 
 const program = new Command();
 
@@ -1209,6 +1219,145 @@ acceptUnusedWorkspaceOption(
       else check("Cloudflare 已登录");
     } catch (error) {
       handleCliError(error, opts.json);
+    }
+  });
+
+// ---------------------------------------------------------------- browser (Browser Lease single-writer control)
+
+const browser = program
+  .command("browser")
+  .description("Local Browser Lease control (never touches the real Edge profile)");
+
+function browserStateLine(state: BrowserLeaseView): string {
+  const suffix = state.expired ? " (expired)" : "";
+  if (state.owner === "agent") return `owner=agent${suffix} lease=${state.leaseId ?? "?"} expiresAt=${state.expiresAt ?? "?"}`;
+  if (state.owner === "user") return `owner=user${suffix} since=${state.acquiredAt ?? "?"}`;
+  return `owner=available revision=${state.revision}`;
+}
+
+/** Browser command-local emitter: keeps the 3/4/5 exit codes the global handler would flatten to 1. */
+function handleBrowserCliError(error: unknown, action: string, json: boolean): void {
+  if (error instanceof BrowserLeaseError) {
+    const payload: Record<string, unknown> = { ok: false, action, code: error.code, error: error.message };
+    if (error.state) payload.state = error.state;
+    if (json) say(JSON.stringify(payload));
+    else cross(`${error.code}: ${error.message}`);
+    process.exitCode = error.exitCode;
+    return;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  if (json) say(JSON.stringify({ ok: false, action, code: "UNKNOWN", error: message }));
+  else cross(message);
+  process.exitCode = 1;
+}
+
+function sayBrowserResult(action: string, payload: Record<string, unknown>, json: boolean, human: string): void {
+  if (json) say(JSON.stringify({ ok: true, action, ...payload }));
+  else say(human);
+}
+
+browser
+  .command("status", { isDefault: true })
+  .description("Show the Browser Lease owner for a workspace (read-only, never creates state)")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace?: string; json: boolean }) => {
+    const action = "status";
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const state = getBrowserLeaseStatus(workspace.id);
+      sayBrowserResult(action, { changed: false, state }, opts.json, browserStateLine(state));
+    } catch (error) {
+      handleBrowserCliError(error, action, opts.json);
+    }
+  });
+
+browser
+  .command("acquire")
+  .description("Acquire an agent browser lease")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace?: string; json: boolean }) => {
+    const action = "acquire";
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const result = acquireBrowserLease(workspace.id);
+      sayBrowserResult(action, { changed: result.changed, state: result.state }, opts.json, `已获取 agent lease：${result.state.leaseId ?? "?"}`);
+    } catch (error) {
+      handleBrowserCliError(error, action, opts.json);
+    }
+  });
+
+browser
+  .command("renew")
+  .description("Extend the agent browser lease held by --lease")
+  .requiredOption("--lease <id>")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { lease: string; workspace?: string; json: boolean }) => {
+    const action = "renew";
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const result = renewBrowserLease(workspace.id, opts.lease);
+      sayBrowserResult(action, { changed: result.changed, state: result.state }, opts.json, `已续租：${result.state.leaseId ?? "?"}`);
+    } catch (error) {
+      handleBrowserCliError(error, action, opts.json);
+    }
+  });
+
+browser
+  .command("release")
+  .description("Release the agent browser lease held by --lease")
+  .requiredOption("--lease <id>")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { lease: string; workspace?: string; json: boolean }) => {
+    const action = "release";
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const result = releaseBrowserLease(workspace.id, opts.lease);
+      sayBrowserResult(action, { changed: result.changed, state: result.state }, opts.json, "已释放 agent lease，browser 现在 available");
+    } catch (error) {
+      handleBrowserCliError(error, action, opts.json);
+    }
+  });
+
+browser
+  .command("take")
+  .description("Take browser control for the user; the only op allowed to recover corrupt state")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace?: string; json: boolean }) => {
+    const action = "take";
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const result = takeBrowserControl(workspace.id);
+      const payload: Record<string, unknown> = { changed: result.changed, state: result.state };
+      if (result.recoveredFromCorrupt) payload.recoveredFromCorrupt = true;
+      const human = result.recoveredFromCorrupt
+        ? "已隔离损坏的 lease state，browser 现在 owner=user"
+        : result.changed
+          ? "browser 现在 owner=user"
+          : "user 已持有 browser 控制权（幂等，无变化）";
+      sayBrowserResult(action, payload, opts.json, human);
+    } catch (error) {
+      handleBrowserCliError(error, action, opts.json);
+    }
+  });
+
+browser
+  .command("resume")
+  .description("Resume automation after a user takeover: user -> available; never creates an agent lease")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace?: string; json: boolean }) => {
+    const action = "resume";
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const result = resumeBrowserControl(workspace.id);
+      sayBrowserResult(action, { changed: result.changed, state: result.state }, opts.json, "browser 现在 available；由 skill 重新 acquire");
+    } catch (error) {
+      handleBrowserCliError(error, action, opts.json);
     }
   });
 

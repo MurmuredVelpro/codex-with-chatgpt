@@ -129,6 +129,41 @@ Prefer semantic role, stable testid/id (known send-button), and message
 structure. If the target cannot be uniquely identified, stop and report; never
 guess a selector and never click a similar element.
 
+**0. Browser Lease gate (single writer).** Before ANY proactive Playwright
+MCP call — including read/poll — the workspace MUST hold an active `agent`
+Browser Lease. It is local state only:
+`c2c browser status|take|resume|acquire|renew|release -w <workspace> [--json]`.
+State lives at `<stateDir>/browser-leases/<workspaceId>.json`, separate from
+SavedSession / ProtocolState; `session clear` never touches it; the MCP server
+exposes no lease write tool.
+- acquire before the first browser action of a batch, release when the batch
+  ends. Never hold a lease across a long wait for ChatGPT.
+- short turn: `status` -> `acquire` -> one browser action batch -> `release`.
+- reply poll: per poll `acquire` -> ONE cheap read -> `release` (see item 8).
+- SEND is one indivisible transaction under ONE leaseId; see item 6.
+- every browser WRITE (`browser_tabs` new/select/close, `browser_navigate`,
+  `browser_type`, `browser_click`, `browser_press_key` that changes the page):
+  check the lease immediately BEFORE and immediately AFTER the RPC. If the
+  post-check shows the lease was lost, STOP — no further browser call, never
+  send a second time.
+- this is a COOPERATIVE gate. `take` can land between the before-check and the
+  RPC dispatch, or while a RPC is in flight; an in-flight Playwright RPC cannot
+  be physically interrupted. The gate narrows the window and stops later
+  actions only.
+- `owner=user` -> stop ALL proactive MCP calls, including read/poll. Only
+  `c2c browser status` (local, read-only) is allowed.
+- user says 接管 -> `c2c browser take -w <workspace>` -> stop browser
+  automation, no auto-resume. user says 继续 -> `c2c browser resume -w
+  <workspace>` -> `acquire` -> full preflight -> recover canonical conversation
+  -> re-read the latest human message; human feedback / a new PLAN overrides the
+  old plan; if unclear, ask ChatGPT Web for a fresh PLAN. `resume` never creates
+  an agent lease by itself.
+- exit codes: 3 `BROWSER_BUSY` / `USER_CONTROL` / `AGENT_CONTROL` /
+  `LOCK_TIMEOUT`; 4 `LEASE_STALE` / `LEASE_EXPIRED`; 5 `STATE_CORRUPT`. On any
+  failure stop and report; only `browser take` may recover `STATE_CORRUPT`
+  (quarantines the bad file, becomes `user`).
+
+
 1. **Tabs.** A tab has no stable id — only an index and a current tab.
    At the start of every batch of browser actions:
    1. `browser_tabs` to list,
@@ -204,6 +239,31 @@ guess a selector and never click a similar element.
    auxiliary only. Never use `browser_evaluate` to click — a JS click is
    forbidden. Never resend because the reply is slow.
 
+Composer draft protection (mandatory). Before ANY `browser_type` / fill: 1.
+select target tab, 2. re-find composer, 3. read its current value/text.
+If non-empty -> treat it USER_DRAFT: never clear, never overwrite, never
+type, never send. Instead must run `c2c browser take -w <workspace> --json`,
+discard current agent leaseId, treat owner as `user` / USER_CONTROL, report
+user, stop ALL later Playwright browser MCP calls, and wait until user
+explicitly says 继续 before browser resume -> acquire -> full preflight ->
+reread conversation. Agent's own leftover draft from crashed run is
+USER_DRAFT too — never assume it safe to overwrite.
+
+SEND equality + lease. SEND transaction indivisible clamped ONE
+leaseId: acquire -> select tab -> re-find composer -> empty check ->
+`browser_type` submit=false -> re-find + read composer -> EXACT equality check
+-> `browser_click` send exactly once -> post-RPC lease check -> release.
+Forbidden: type -> release -> acquire -> click. Immediately before clicking
+send, re-find and read composer require `actualComposerText ===
+plannedControlMessage` as exact full-string `===`. If they differ -> NEVER
+`browser_click` send, must run `c2c browser take -w <workspace> --json`,
+discard current agent leaseId, treat as USER_DRAFT / USER_CONTROL, stop ALL
+later Playwright browser MCP calls, report user, and wait until user
+explicitly says 继续 before browser resume -> acquire -> full preflight ->
+reread conversation. Keep planned message in memory for current turn only;
+never persist an `expectedMessageHash`.
+
+
 7. **One conversation, Chat mode.** C2C runs only in Chat. Chat and Work
    (聊天 / 工作) are separate surfaces; a Work conversation cannot become a C2C
    Chat. On every new or restored conversation, read the Chat/Work switcher when
@@ -240,6 +300,9 @@ guess a selector and never click a similar element.
    completes before the deadline, continue normally immediately.
    Each poll is one cheap read: `browser_find` / `browser_snapshot`. Do NOT
    hold one long wait, do NOT screenshot-poll, and do NOT resend.
+ Each poll is its own lease cycle: `acquire` -> one cheap
+ `browser_find` / `browser_snapshot` read -> `release`. Do NOT hold a lease
+ while waiting between polls, and do NOT poll at all while `owner=user`.
    - still generating → wait again (do not type, do not resend);
    - `STATE: PLAN` / `DONE` / `BLOCKED` / the verify workspace name → read it
      and continue the existing protocol;
@@ -267,6 +330,15 @@ guess a selector and never click a similar element.
    Scope the read to the main conversation message structure. Never take the
    first string match: that can hit the sidebar, the chat title, the user
    message, or the composer.
+
+Body short-read fallback (read-only). When a reply is long, a normal accessible
+read may return only `C2C` / `C2` while the full reply is present on the page.
+When the assistant body is obviously too short but the page clearly contains
+the full reply, you MAY use read-only `browser_evaluate` to read that assistant
+message container's `textContent` as a fallback. Strictly read-only: no DOM
+mutation, no click, no `browser_run_code_unsafe`. Normal `browser_snapshot` /
+`browser_find` stays the preferred path.
+
 
 10. **Conversation URL.** Before sending it may be `https://chatgpt.com/`.
    Right after sending, ChatGPT briefly shows a transition URL `/c/WEB:<id>`.
@@ -302,6 +374,10 @@ guess a selector and never click a similar element.
   `restart`, `start`, `stop`, `status`, `pair`, `unpair`, `logs`, `workspace`,
   `record`, `tunnel status`, `tunnel choose`), pass `-w <workspace root>`
   (the project the user is working on, NOT the c2c repo).
+- `browser` commands are local (no Playwright, no Edge): `browser status`
+ (default subcommand), `browser acquire|take|resume -w <workspace>`, and
+ `browser renew|release -w <workspace> --lease <id>`. They take `-w` and
+ `--json`, and exit 3/4/5 for lease failures instead of flattening to 1.
 - Do not add `-w` to machine-wide commands: `update-check`, `sandbox-allow`,
   `prefs`, `tunnel login`. They still accept and ignore `-w`, so a leftover
   flag must not fail the command.
