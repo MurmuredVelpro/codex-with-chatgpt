@@ -1,7 +1,6 @@
 import { Command, InvalidArgumentError } from "commander";
 import fs from "node:fs";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { startBridge } from "../bridge/server.js";
 import { findBridgeObservation, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
@@ -56,6 +55,17 @@ import {
 } from "../session/state.js";
 import { appendExecutionRecord } from "../execution/records.js";
 import { saveExecutionOutput } from "../execution/output.js";
+import { checkForUpdate, type UpdateCheckResult } from "../update/check.js";
+import {
+  acquireBrowserLease,
+  BrowserLeaseError,
+  getBrowserLeaseStatus,
+  releaseBrowserLease,
+  renewBrowserLease,
+  resumeBrowserControl,
+  takeBrowserControl,
+  type BrowserLeaseView,
+} from "../browser/lease.js";
 
 const program = new Command();
 
@@ -808,17 +818,6 @@ acceptUnusedWorkspaceOption(
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
-function runGit(args: string[]): { ok: boolean; stdout: string } {
-  const result = spawnSync("git", args, {
-    cwd: repoRoot,
-    encoding: "utf8",
-    timeout: 8000,
-    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
-    windowsHide: true,
-  });
-  return { ok: result.status === 0, stdout: (result.stdout ?? "").trim() };
-}
-
 acceptUnusedWorkspaceOption(
   program
     .command("update-check")
@@ -829,43 +828,36 @@ acceptUnusedWorkspaceOption(
   .action((opts: { force: boolean; json: boolean }) => {
     const file = path.join(getStateDir(), "update-check.json");
     const today = new Date().toLocaleDateString("en-CA"); // YYYY-MM-DD in local tz
-    let last: { date?: string; updateAvailable?: boolean } = {};
+    let last: UpdateCheckResult & { date?: string } = { checked: false, updateAvailable: false };
     try {
       last = JSON.parse(fs.readFileSync(file, "utf8")) as typeof last;
     } catch {
       /* first run */
     }
 
-    const emit = (data: {
-      checked: boolean;
-      updateAvailable: boolean;
-      localCommit?: string;
-      remoteCommit?: string;
-      note?: string;
-    }): void => {
+    const emit = (data: UpdateCheckResult): void => {
       if (opts.json) say(JSON.stringify({ ok: true, version: VERSION, ...data }));
-      else if (data.updateAvailable) say(`发现新版本（本地 ${data.localCommit?.slice(0, 7)} → 远端 ${data.remoteCommit?.slice(0, 7)}）。`);
+      else if (data.updateAvailable && data.manualUpdateRequired)
+        say("检测到上游更新；当前为定制分支，需要手动同步，上游更新暂未自动应用。");
+      else if (data.updateAvailable)
+        say(`发现新版本（本地 ${data.localCommit?.slice(0, 7)} → 远端 ${data.remoteCommit?.slice(0, 7)}）。`);
       else say(data.note ?? "已是最新版本。");
     };
 
     if (!opts.force && last.date === today) {
-      emit({ checked: false, updateAvailable: last.updateAvailable ?? false, note: "今天已检查过更新。" });
+      emit({ ...last, checked: false, note: "今天已检查过更新。" });
       return;
     }
 
-    const local = runGit(["rev-parse", "HEAD"]);
-    const remote = runGit(["ls-remote", "origin", "HEAD"]);
-    if (!local.ok || !remote.ok || !remote.stdout) {
-      // Offline or not a git checkout: skip quietly and retry tomorrow-ish (do not
-      // record the date so a transient failure does not suppress the daily check).
-      emit({ checked: false, updateAvailable: false, note: "无法检查更新（离线或非 git 安装），已跳过。" });
+    const result = checkForUpdate(repoRoot);
+    if (!result.checked) {
+      emit(result);
       return;
     }
-    const remoteCommit = remote.stdout.split(/\s/)[0];
-    const updateAvailable = remoteCommit !== local.stdout;
+
     fs.mkdirSync(getStateDir(), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify({ date: today, updateAvailable, remoteCommit }), { mode: 0o600 });
-    emit({ checked: true, updateAvailable, localCommit: local.stdout, remoteCommit });
+    fs.writeFileSync(file, JSON.stringify({ date: today, ...result }), { mode: 0o600 });
+    emit(result);
   });
 
 // ---------------------------------------------------------------- session (ChatGPT conversation / Project memory)
@@ -1227,6 +1219,145 @@ acceptUnusedWorkspaceOption(
       else check("Cloudflare 已登录");
     } catch (error) {
       handleCliError(error, opts.json);
+    }
+  });
+
+// ---------------------------------------------------------------- browser (Browser Lease single-writer control)
+
+const browser = program
+  .command("browser")
+  .description("Local Browser Lease control (never touches the real Edge profile)");
+
+function browserStateLine(state: BrowserLeaseView): string {
+  const suffix = state.expired ? " (expired)" : "";
+  if (state.owner === "agent") return `owner=agent${suffix} lease=${state.leaseId ?? "?"} expiresAt=${state.expiresAt ?? "?"}`;
+  if (state.owner === "user") return `owner=user${suffix} since=${state.acquiredAt ?? "?"}`;
+  return `owner=available revision=${state.revision}`;
+}
+
+/** Browser command-local emitter: keeps the 3/4/5 exit codes the global handler would flatten to 1. */
+function handleBrowserCliError(error: unknown, action: string, json: boolean): void {
+  if (error instanceof BrowserLeaseError) {
+    const payload: Record<string, unknown> = { ok: false, action, code: error.code, error: error.message };
+    if (error.state) payload.state = error.state;
+    if (json) say(JSON.stringify(payload));
+    else cross(`${error.code}: ${error.message}`);
+    process.exitCode = error.exitCode;
+    return;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  if (json) say(JSON.stringify({ ok: false, action, code: "UNKNOWN", error: message }));
+  else cross(message);
+  process.exitCode = 1;
+}
+
+function sayBrowserResult(action: string, payload: Record<string, unknown>, json: boolean, human: string): void {
+  if (json) say(JSON.stringify({ ok: true, action, ...payload }));
+  else say(human);
+}
+
+browser
+  .command("status", { isDefault: true })
+  .description("Show the Browser Lease owner for a workspace (read-only, never creates state)")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace?: string; json: boolean }) => {
+    const action = "status";
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const state = getBrowserLeaseStatus(workspace.id);
+      sayBrowserResult(action, { changed: false, state }, opts.json, browserStateLine(state));
+    } catch (error) {
+      handleBrowserCliError(error, action, opts.json);
+    }
+  });
+
+browser
+  .command("acquire")
+  .description("Acquire an agent browser lease")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace?: string; json: boolean }) => {
+    const action = "acquire";
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const result = acquireBrowserLease(workspace.id);
+      sayBrowserResult(action, { changed: result.changed, state: result.state }, opts.json, `已获取 agent lease：${result.state.leaseId ?? "?"}`);
+    } catch (error) {
+      handleBrowserCliError(error, action, opts.json);
+    }
+  });
+
+browser
+  .command("renew")
+  .description("Extend the agent browser lease held by --lease")
+  .requiredOption("--lease <id>")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { lease: string; workspace?: string; json: boolean }) => {
+    const action = "renew";
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const result = renewBrowserLease(workspace.id, opts.lease);
+      sayBrowserResult(action, { changed: result.changed, state: result.state }, opts.json, `已续租：${result.state.leaseId ?? "?"}`);
+    } catch (error) {
+      handleBrowserCliError(error, action, opts.json);
+    }
+  });
+
+browser
+  .command("release")
+  .description("Release the agent browser lease held by --lease")
+  .requiredOption("--lease <id>")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { lease: string; workspace?: string; json: boolean }) => {
+    const action = "release";
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const result = releaseBrowserLease(workspace.id, opts.lease);
+      sayBrowserResult(action, { changed: result.changed, state: result.state }, opts.json, "已释放 agent lease，browser 现在 available");
+    } catch (error) {
+      handleBrowserCliError(error, action, opts.json);
+    }
+  });
+
+browser
+  .command("take")
+  .description("Take browser control for the user; the only op allowed to recover corrupt state")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace?: string; json: boolean }) => {
+    const action = "take";
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const result = takeBrowserControl(workspace.id);
+      const payload: Record<string, unknown> = { changed: result.changed, state: result.state };
+      if (result.recoveredFromCorrupt) payload.recoveredFromCorrupt = true;
+      const human = result.recoveredFromCorrupt
+        ? "已隔离损坏的 lease state，browser 现在 owner=user"
+        : result.changed
+          ? "browser 现在 owner=user"
+          : "user 已持有 browser 控制权（幂等，无变化）";
+      sayBrowserResult(action, payload, opts.json, human);
+    } catch (error) {
+      handleBrowserCliError(error, action, opts.json);
+    }
+  });
+
+browser
+  .command("resume")
+  .description("Resume automation after a user takeover: user -> available; never creates an agent lease")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace?: string; json: boolean }) => {
+    const action = "resume";
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const result = resumeBrowserControl(workspace.id);
+      sayBrowserResult(action, { changed: result.changed, state: result.state }, opts.json, "browser 现在 available；由 skill 重新 acquire");
+    } catch (error) {
+      handleBrowserCliError(error, action, opts.json);
     }
   });
 

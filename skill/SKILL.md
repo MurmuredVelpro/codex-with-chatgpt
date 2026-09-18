@@ -47,18 +47,21 @@ whatever data it needs by itself.
    These prefs are for this machine, not per workspace. Do not ask again
    on reconnect or a second repo. A new computer (empty prefs) asks/checks
    once.
-5. ALWAYS use the built-in in-app browser (iab) for every ChatGPT step.
-   Follow **In-app browser (ChatGPT)** below. NEVER Computer Use (no
-   screenshot-click). NEVER launch or control a third-party/external browser
-   (Chrome, Safari, Edge…), and never use `open <url>` to hand off to one.
-   - The ONLY exception: the user explicitly says the Cloudflare login must use
-     their own browser session — that single Cloudflare login step may go through
-     their browser; everything else stays in the built-in browser.
-   - If the user asks to run ChatGPT in their own browser, refuse politely and
-     explain: "Codex 需要持续调用 ChatGPT 和配置连接，这会频繁操作页面，可能影响
-     你浏览器的正常使用。ChatGPT 只能跑在内置浏览器里。" Only if the user replies
-     with an explicit "我愿意承担影响" may you proceed in their browser; otherwise
-     keep ChatGPT in the built-in browser, every time they ask.
+5. ALWAYS drive ChatGPT through the remote Playwright MCP server named
+   `playwright` — see **Browser control (Playwright MCP)** below. NEVER Codex
+   IAB / `control-in-app-browser`, NEVER Browser Use, NEVER Computer Use, NEVER
+   a WSL Chromium or a Linux Edge, and never `open <url>`. The browser behind
+   that server is the dedicated Windows Edge C2C profile; the user's daily Edge
+   profile is never touched.
+   - Navigating to a Chrome/Edge internal page (`edge://*`, `chrome://*`) is
+     forbidden: it detaches the CDP session and drops the tab out of the
+     Playwright-managed group.
+   - If the Playwright MCP server is unavailable, stop and report. Do not fall
+     back to Codex IAB, Browser Use, Computer Use, or any other browser.
+   - The only non-ChatGPT browser step you may leave to the user: the single
+     Cloudflare login for `c2c tunnel login`, which may open their own browser
+     (the Golden rule 5 exception referenced by **Connection choice**). Never
+     type their credentials.
 6. Conversation reuse depends on `c2c session --json` → `conversation.mode`
    (see Conversation management). Do not invent a second mode.
    - **long-chat** (legacy session file, or the user opted out): ONE ChatGPT
@@ -67,7 +70,7 @@ whatever data it needs by itself.
      ONE ChatGPT Project (collection) per workspace. Same Codex conversation
      reuses the ChatGPT chat URL saved in THIS thread. A new Codex
      conversation opens a new chat from the Project collection page — never
-     `goto` `https://chatgpt.com/` to create it, and never reuse another
+     navigate to `https://chatgpt.com/` to create it, and never reuse another
      Codex conversation's chat URL just because `session.url` exists.
    Each workspace also has exactly ONE ChatGPT connector. Do not create a
    second connector for the same workspace. Other workspaces may have their
@@ -76,11 +79,11 @@ whatever data it needs by itself.
    settings directory. Run `c2c sandbox-allow --json` (idempotent). If it fails
    with EPERM / Operation not permitted, request elevated permissions and retry
    ONCE. After `{ "alreadyAllowed": true }` or `{ "added": true }`, stay silent.
-8. ChatGPT pages: only the URLs in **In-app browser (ChatGPT)**. Never start
-   from chatgpt.com and click through menus.
-9. **Doctor gate.** After `c2c doctor --json`, do not `goto` ChatGPT and do not
-   send `[C2C]` until local is green — except the reconnect settings pages when
-   `chatgptRepair.needed` is true. Not green:
+8. ChatGPT pages: only the URLs in **Browser control (Playwright MCP)**. Never
+   start from chatgpt.com and click through menus.
+9. **Doctor gate.** After `c2c doctor --json`, do not navigate to ChatGPT and
+   do not send `[C2C]` until local is green — except the reconnect settings
+   pages when `chatgptRepair.needed` is true. Not green:
    - `report.bridge.ok` is not true
    - `report.mcp.ok` is not true (unauthenticated local `/mcp` must be 401)
    - sandbox / state-dir write failed (EPERM)
@@ -93,35 +96,120 @@ whatever data it needs by itself.
      `chatgptRepair`. Wait and run doctor again.
    If doctor is already green and `chatgptRepair.needed` is false, do not
    `c2c restart`, do not start a second tunnel, and do not Delete the
-   connector. ChatGPT/IAB-only errors are not permission to churn the
+   connector. ChatGPT/browser-only errors are not permission to churn the
    public address.
    A ChatGPT-side 401 after a sent message is different: repair then, do not
    treat it as permission to skip this gate next time.
 
-## In-app browser (ChatGPT)
+## Browser control (remote Playwright MCP)
 
-Official skill: `control-in-app-browser`. These C2C rules override defaults
-that close the tab, hide the window, or stall on the settings page.
+ChatGPT Web is driven ONLY through the remote Playwright MCP server named
+`playwright`. Backend chain:
 
-1. **Surface.** Once per Codex session: `setupBrowserRuntime()`, then
-   `const iab = await agent.browsers.get("iab")`. Reuse `iab`. Do not re-read
-   `documentation()` if it is already bound. Never `getDefault()`, `getForUrl()`,
-   or Computer Use.
+    WSL Codex
+      → remote Playwright MCP
+      → Windows Playwright MCP Server
+      → Microsoft Edge Extension
+      → dedicated C2C Edge profile
 
-2. **One tab.** Create the ChatGPT tab once (`tabs.new()`). After that, only
-   `tab.goto(...)` to switch URLs. If the tab still exists, claim it — never
-   open a second ChatGPT tab. Do not `goto` the URL you are already on.
+Never Codex IAB / `control-in-app-browser`, Browser Use, Computer Use, a WSL
+Chromium, or a Linux Edge. Never `open <url>`. Never touch the user's daily
+Edge profile. Never navigate to `edge://*` or `chrome://*` — an internal page
+detaches the CDP session and drops the tab out of the Playwright-managed group.
 
-3. **Foreground + keep (standby).** Right after opening or claiming the tab:
-   - `await (await iab.capabilities.get("visibility")).set(true)` — first-time
-     setup and ChatGPT chatting stay in front of the user so they can watch.
-   - `await tab.markHandoff()` immediately, then again at the start and end of
-     every turn. After setup succeeds or the C2C chat is open, also
-     `await tab.markDeliverable()`.
-   Never close this tab. Finished, waiting for the user, or timed out: leave it
-   marked (standby). Do not let default turn cleanup close it.
+Tools: `browser_tabs`, `browser_navigate`, `browser_snapshot`, `browser_find`,
+`browser_type`, `browser_click`, `browser_wait_for`, plus `browser_evaluate`,
+`browser_network_requests`, and `browser_console_messages` for read-only
+diagnostics only. Never use `browser_run_code_unsafe`, never modify the DOM,
+and never trigger clicks through JavaScript.
 
-4. **URLs only** (same tab, `goto` — never hunt menus):
+Observed fallback anchors, not permanent identifiers: Chinese UI text
+`与 ChatGPT 聊天`, `聊天 / 工作`, `停止回答`, `ChatGPT 说：`, `回复操作`.
+Prefer semantic role, stable testid/id (known send-button), and message
+structure. If the target cannot be uniquely identified, stop and report; never
+guess a selector and never click a similar element.
+
+**0. Browser Lease gate (single writer).** Before ANY proactive Playwright
+MCP call — including read/poll — the workspace MUST hold an active `agent`
+Browser Lease. It is local state only:
+`c2c browser status|take|resume|acquire|renew|release -w <workspace> [--json]`.
+State lives at `<stateDir>/browser-leases/<workspaceId>.json`, separate from
+SavedSession / ProtocolState; `session clear` never touches it; the MCP server
+exposes no lease write tool.
+- acquire before the first browser action of a batch, release when the batch
+  ends. Never hold a lease across a long wait for ChatGPT.
+- short turn: `status` -> `acquire` -> one browser action batch -> `release`.
+- reply poll: per poll `acquire` -> ONE cheap read -> `release` (see item 8).
+- SEND is one indivisible transaction under ONE leaseId; see item 6.
+- every browser WRITE (`browser_tabs` new/select/close, `browser_navigate`,
+  `browser_type`, `browser_click`, `browser_press_key` that changes the page):
+  check the lease immediately BEFORE and immediately AFTER the RPC. If the
+  post-check shows the lease was lost, STOP — no further browser call, never
+  send a second time.
+- this is a COOPERATIVE gate. `take` can land between the before-check and the
+  RPC dispatch, or while a RPC is in flight; an in-flight Playwright RPC cannot
+  be physically interrupted. The gate narrows the window and stops later
+  actions only.
+- `owner=user` -> stop ALL proactive MCP calls, including read/poll. Only
+  `c2c browser status` (local, read-only) is allowed.
+- user says 接管 -> `c2c browser take -w <workspace>` -> stop browser
+  automation, no auto-resume. user says 继续 -> `c2c browser resume -w
+  <workspace>` -> `acquire` -> full preflight -> recover canonical conversation
+  -> re-read the latest human message; human feedback / a new PLAN overrides the
+  old plan; if unclear, ask ChatGPT Web for a fresh PLAN. `resume` never creates
+  an agent lease by itself.
+- exit codes: 3 `BROWSER_BUSY` / `USER_CONTROL` / `AGENT_CONTROL` /
+  `LOCK_TIMEOUT`; 4 `LEASE_STALE` / `LEASE_EXPIRED`; 5 `STATE_CORRUPT`. On any
+  failure stop and report; only `browser take` may recover `STATE_CORRUPT`
+  (quarantines the bad file, becomes `user`).
+
+
+1. **Tabs.** A tab has no stable id — only an index and a current tab.
+   At the start of every batch of browser actions:
+   1. `browser_tabs` to list,
+   2. find the target ChatGPT tab,
+   3. `browser_tabs` to select it,
+   4. re-run `browser_find` / `browser_snapshot` after the select.
+   Never reuse a ref captured before a select or a navigation — a navigation
+   invalidates every old ref. Keep at most ONE managed ChatGPT tab per
+   workspace. Never persist a tab id or index into the session file. If the
+   tab is gone, reopen it from the canonical conversation URL. If creating a
+   tab fails with a transient tab-edit error (e.g. "Tabs cannot be edited
+   right now"), retry that same step at most once.
+
+   Do not treat a tab as the target C2C tab merely because it is current or
+   its URL contains `chatgpt.com`. Locate the target in this order:
+   1. the canonical conversation URL already saved for the current C2C thread
+      or workspace,
+   2. the current workspace's Project URL,
+   3. only when no saved conversation exists, create a new managed tab.
+   Never reuse another workspace's ChatGPT tab.
+
+2. **Preflight before any C2C control message.** In order:
+   1. `c2c doctor -w <workspace> --json`
+   2. `c2c session -w <workspace> --json`
+   3. `browser_tabs` list
+   4. restore or create the target ChatGPT managed tab
+   5. `browser_tabs` select
+   6. navigate only if needed: saved conversation URL → project URL →
+      `https://chatgpt.com/`
+   7. re-run `browser_find` for the composer
+   8. check: logged in, no Cloudflare / login wall, no Retry-only / error,
+      and the current surface is **Chat**, not Work.
+   Send nothing until every check passes. If any check fails, stop and report.
+
+3. **Managed tab + standby.** Always `browser_tabs` select the target managed
+   tab before browser automation. After the select, re-run `browser_find` /
+   `browser_snapshot`; refs from before the select are invalid. Do not assume
+   Playwright can activate the Windows OS window. Whether the user can see the
+   Edge window is not a requirement for protocol correctness. Do not close the
+   tab between turns — leave it open as standby so default turn cleanup cannot
+   drop it. There is no browser-level handoff or deliverable marking any more:
+   `markHandoff()` and `markDeliverable()` are gone, and there is no Playwright
+   equivalent. Standby semantics live in the C2C protocol message, the local
+   checkpoint, and the conversation URL.
+
+4. **URLs only** (same tab, `browser_navigate` — never hunt menus):
    - 开发人员模式: `https://chatgpt.com/#settings/Security`
      (skip when `c2c prefs --json` has `developerModeEnabled: true`)
    - 插件总管: `https://chatgpt.com/plugins`
@@ -138,44 +226,140 @@ that close the tab, hide the window, or stall on the settings page.
    address into Project instructions — write the connector **name** only.
 
 5. **Do not wait for 8 tools** on the settings page. "Connected" / authorize
-   success / pairing accepted is enough. Confirm tools in the conversation with
-   `workspace_info`.
+   success / pairing accepted is enough. Confirm the tools in the conversation
+   with `workspace_info`. Batch a known form into as few browser calls as you
+   can, then one cheap DOM check. Do not screenshot-poll.
 
-6. **Batch.** Fill a known form in one Playwright / `js` script when you can.
-   After an action, one cheap DOM check. Do not screenshot-poll.
+6. **Composer / send contract.** Composer is a `textbox`, currently named
+   `与 ChatGPT 聊天`. Fill it with `browser_type` / fill and `submit=false` —
+   never Enter, never a keyboard shortcut. Then re-select the tab, re-find the
+   send button, and `browser_click` it exactly ONCE. Prefer the stable
+   identifiers `data-testid="send-button"` / `id="composer-submit-button"`.
+   The accessible name (`发送消息` / `发送提示词`) drifts with locale and is
+   auxiliary only. Never use `browser_evaluate` to click — a JS click is
+   forbidden. Never resend because the reply is slow.
 
-7. **One conversation, Chat mode.** The first ChatGPT chat is the C2C
-   conversation. Chat and Work (聊天 / 工作) are separate: a Work conversation
-   cannot become Chat. On every NEW conversation, if a Chat/Work switcher is
-   visible (often top-left), confirm **Chat** is selected before the boot
-   prompt. If it is Work, do not continue there — Switch to a new Chat
-   conversation (HANDOFF). If no switcher is visible, do not hunt menus; continue.
-   Send the boot prompt and the workspace_info check in that Chat conversation.
+Composer draft protection (mandatory). Before ANY `browser_type` / fill: 1.
+select target tab, 2. re-find composer, 3. read its current value/text.
+If non-empty -> treat it USER_DRAFT: never clear, never overwrite, never
+type, never send. Instead must run `c2c browser take -w <workspace> --json`,
+discard current agent leaseId, treat owner as `user` / USER_CONTROL, report
+user, stop ALL later Playwright browser MCP calls, and wait until user
+explicitly says 继续 before browser resume -> acquire -> full preflight ->
+reread conversation. Agent's own leftover draft from crashed run is
+USER_DRAFT too — never assume it safe to overwrite.
+
+SEND equality + lease. SEND transaction indivisible clamped ONE
+leaseId: acquire -> select tab -> re-find composer -> empty check ->
+`browser_type` submit=false -> re-find + read composer -> EXACT equality check
+-> `browser_click` send exactly once -> post-RPC lease check -> release.
+Forbidden: type -> release -> acquire -> click. Immediately before clicking
+send, re-find and read composer require `actualComposerText ===
+plannedControlMessage` as exact full-string `===`. If they differ -> NEVER
+`browser_click` send, must run `c2c browser take -w <workspace> --json`,
+discard current agent leaseId, treat as USER_DRAFT / USER_CONTROL, stop ALL
+later Playwright browser MCP calls, report user, and wait until user
+explicitly says 继续 before browser resume -> acquire -> full preflight ->
+reread conversation. Keep planned message in memory for current turn only;
+never persist an `expectedMessageHash`.
+
+
+7. **One conversation, Chat mode.** C2C runs only in Chat. Chat and Work
+   (聊天 / 工作) are separate surfaces; a Work conversation cannot become a C2C
+   Chat. On every new or restored conversation, read the Chat/Work switcher when
+   present and confirm **聊天 (Chat)** is selected before any C2C control
+   message. If it is Work, stop browser automation immediately, tell the user to
+   switch the C2C page to Chat, and wait for user confirmation. After the user
+   confirms, re-run the full preflight. First version: never auto-switch
+   Work → Chat and never send HANDOFF to a Work conversation. If no switcher is
+   visible, do not hunt menus; continue only when the surface is otherwise
+   confirmed Chat. Send the boot prompt and the workspace_info check in that
+   Chat conversation.
    Confirm the reply names the current workspace **before** saving or replacing
    the session URL. If validation fails, keep the old saved URL. Do not open a
    throwaway verify chat and later another C2C chat.
 
    A collection or chat page that shows only `Retry` / `重试` is a navigation
-   error, not generation and not a pairing failure. Reuse the same iab tab.
-   Try Retry once. If it stays Retry-only, `goto` the last working chat URL
+   error, not generation and not a pairing failure. Reuse the same managed tab.
+   Try Retry once. If it stays Retry-only, navigate to the last working chat URL
    from this thread (or `session.url` if that is the only saved chat), then
-   click the on-page `Open … project` / `打开“… ”项目` link — that same-site
+   click the on-page `Open … project` / `打开"…"项目` link — that same-site
    hop is allowed. Do not treat the URLs-only rule as forbidding this link.
    On the collection, require the project chat list and new-chat composer
    before continuing. Keep the old saved URL/checkpoint until the replacement
    chat passes workspace_info. Do not `session clear`. Do not use Computer Use.
 
-8. **Wait for a ChatGPT reply (do not hold one long browser wait).** After you
-   send INIT, EXECUTED, boot, or the workspace_info check: `markHandoff`, keep
-   the tab foreground, and stay in this same task. Do not `waitFor` 5 minutes
-   and do not screenshot-poll. Every 20–30 seconds, one cheap DOM check:
+8. **Wait for a ChatGPT reply (never hold one long wait).** After you send
+   INIT, EXECUTED, the boot prompt, or the workspace_info check, keep the tab
+   and stay in this same task. Poll in short cycles — roughly every 3 seconds
+   for the first 15 seconds, then roughly every 10 seconds until 120 seconds.
+   120 seconds is a soft checkpoint, not a hard failure. If generating/stop
+   still exists, the page is healthy, and there is no `Retry` / `重试` / error /
+   `at capacity` signal, continue polling roughly every 20–30 seconds. Stop
+   after 10 minutes total and report timeout; never resend. If generation
+   completes before the deadline, continue normally immediately.
+   Each poll is one cheap read: `browser_find` / `browser_snapshot`. Do NOT
+   hold one long wait, do NOT screenshot-poll, and do NOT resend.
+ Each poll is its own lease cycle: `acquire` -> one cheap
+ `browser_find` / `browser_snapshot` read -> `release`. Do NOT hold a lease
+ while waiting between polls, and do NOT poll at all while `owner=user`.
    - still generating → wait again (do not type, do not resend);
    - `STATE: PLAN` / `DONE` / `BLOCKED` / the verify workspace name → read it
      and continue the existing protocol;
    - visible error → repair; do not start a new chat.
-   A browser/js timeout is not failure. Claim the same tab, read the page, keep
-   standby. If ChatGPT is still thinking, keep polling. Never open a second
-   tab and never resend INIT/EXECUTED just because a wait timed out.
+   `停止回答` (stop) is an observed fallback anchor for generating, not a
+   permanent identifier. `Retry` / `重试` / error / `at capacity` are failure
+   or retry anchors, not completion.
+   A reply counts as complete only when ALL of these hold:
+   1. an assistant message exists,
+   2. its latest body is readable,
+   3. no generating / stop state is present,
+   4. no `Retry` / `重试` / error / `at capacity`,
+   5. the URL is the canonical conversation URL (see item 10),
+   6. the body text is byte-identical across two consecutive reads.
+   Until all six hold, keep polling. A browser/js timeout is not a failure.
+   Claim the same tab, read the page, keep standby. Never open a second tab and
+   never resend INIT/EXECUTED just because a wait timed out.
+   `browser_network_requests` / `browser_console_messages` are auxiliary
+   diagnostics only — never the sole completion criterion.
+
+9. **Assistant message extraction.** Current Chinese UI:
+   - user turn: heading `你说：`, action group `你的消息操作`
+   - assistant turn: heading `ChatGPT 说：`, the body paragraph, action group
+     `回复操作`
+   Scope the read to the main conversation message structure. Never take the
+   first string match: that can hit the sidebar, the chat title, the user
+   message, or the composer.
+
+Body short-read fallback (read-only). When a reply is long, a normal accessible
+read may return only `C2C` / `C2` while the full reply is present on the page.
+When the assistant body is obviously too short but the page clearly contains
+the full reply, you MAY use read-only `browser_evaluate` to read that assistant
+message container's `textContent` as a fallback. Strictly read-only: no DOM
+mutation, no click, no `browser_run_code_unsafe`. Normal `browser_snapshot` /
+`browser_find` stays the preferred path.
+
+
+10. **Conversation URL.** Before sending it may be `https://chatgpt.com/`.
+   Right after sending, ChatGPT briefly shows a transition URL `/c/WEB:<id>`.
+   That URL is NOT stable and its UUID differs from the final canonical UUID —
+   never write it to the session. Only once the canonical
+   `https://chatgpt.com/c/<id>` (or the Project canonical conversation URL) is
+   visible AND the assistant reply is stable may you write the existing
+   `conversation.chatUrl` / `session.url`. Do not add a browser-specific
+   session field.
+
+11. **Recovery.** Keep the retry-once principle.
+   - tab lost → reopen from the canonical conversation URL
+   - stale ref → re-select the tab, then `browser_find` / `browser_snapshot`
+   - click timeout → select + re-find + retry at most once
+   - `browser_tabs` transient tab-edit error → retry at most once, same step
+   - login / CAPTCHA / Cloudflare wall → stop and ask the user for ONE manual
+     action; never type credentials for them
+   - `edge://*` / `chrome://*` → forbidden, never navigate
+   - Playwright MCP unavailable → stop and report; never fall back to
+     Codex IAB, Browser Use, or Computer Use
+
 
 ## Locations
 
@@ -190,6 +374,10 @@ that close the tab, hide the window, or stall on the settings page.
   `restart`, `start`, `stop`, `status`, `pair`, `unpair`, `logs`, `workspace`,
   `record`, `tunnel status`, `tunnel choose`), pass `-w <workspace root>`
   (the project the user is working on, NOT the c2c repo).
+- `browser` commands are local (no Playwright, no Edge): `browser status`
+ (default subcommand), `browser acquire|take|resume -w <workspace>`, and
+ `browser renew|release -w <workspace> --lease <id>`. They take `-w` and
+ `--json`, and exit 3/4/5 for lease failures instead of flattening to 1.
 - Do not add `-w` to machine-wide commands: `update-check`, `sandbox-allow`,
   `prefs`, `tunnel login`. They still accept and ignore `-w`, so a leftover
   flag must not fail the command.
@@ -207,11 +395,23 @@ commands (both are cheap / cached; never mention them unless an update exists):
    If already allowlisted, this is a no-op and does not trigger elevation.
 
 - `{ "updateAvailable": false }` → continue silently. Never mention the check.
-- `{ "updateAvailable": true }` → tell the user one line:
+- `{ "updateAvailable": true, "manualUpdateRequired": true }` → tell the user exactly:
+  "检测到上游更新；当前为定制分支，需要手动同步，上游更新暂未自动应用。"
+  Continue the original task. Do NOT run the automatic update workflow.
+- `{ "updateAvailable": true, "manualUpdateRequired": false }` → tell the user one line:
   "检测到 Codex with ChatGPT 有新版本，我先更新一下（约 1 分钟），随后继续你的任务。"
   Then run the update workflow below, and CONTINUE the original task afterwards.
 
+The update-check JSON also uses `updateSource` / `remote` (`origin` or
+`upstream`) and `customizedFork` (true when an upstream remote exists). A
+customized fork reports new upstream commits with `manualUpdateRequired: true`;
+it never treats local custom commits as remote updates.
+
 ## Workflow: update（"更新 Codex with ChatGPT"，or triggered by the daily check）
+
+This workflow is only for `manualUpdateRequired: false`. A customized fork
+must never auto-pull, merge, or rebase here; report the manual-sync message and
+continue the original task.
 
 Inside the checkout directory (see Locations):
 
@@ -277,8 +477,9 @@ Speak only of 临时地址 / 固定域名 / 登录 Cloudflare.
      `接下来用手动教学配置。一次只需要做一个操作。`
      Do not say 自动配置没有成功.
    - `setupMode: "auto"`: continue with step 5. Keep the two-failure fallback.
-5. Open ChatGPT on the ONE iab tab (see **In-app browser**). Foreground +
-   markHandoff immediately. Same tab, `goto` only:
+5. Open ChatGPT on the ONE managed tab (see **Browser control**). Select the
+   target managed tab; do not assume Playwright can activate the Windows OS
+   window. Same tab, `browser_navigate` only:
    - 开发人员模式: skip `https://chatgpt.com/#settings/Security` when
      `developerModeEnabled` is true. Otherwise open it, enable 开发人员模式
      ("Developer mode") if it is off, then `c2c prefs set --developer-mode`.
@@ -286,7 +487,7 @@ Speak only of 临时地址 / 固定域名 / 登录 Cloudflare.
      mode is required, open this page, enable it, save `--developer-mode`,
      and retry create — do not skip that recovery.
    - 已有该 `connectorName`: `https://chatgpt.com/plugins` — Delete it (never
-     Reconnect). Then `goto` the 加插件 URL below.
+     Reconnect). Then navigate to the 加插件 URL below.
    - 还没有 / 刚删掉: `https://chatgpt.com/plugins#settings/Connectors?create-connector=true&redirectAfter=%2Fplugins`
      Operate ONLY on `connectorName` from step 3:
       - If that exact name exists: Delete it, then create it again. Never
@@ -296,19 +497,26 @@ Speak only of 临时地址 / 固定域名 / 登录 Cloudflare.
       - Description: `Securely connect ChatGPT to the current Codex workspace for planning and review.`
       - Server URL: the `mcpUrl` from step 3
       - Authentication: OAuth
-     Fill the known form in one script when you can. Then Connect / Authorize.
+     Use only verified high-level Playwright MCP tools for form work:
+     `browser_find`, `browser_type`, `browser_click`, `browser_snapshot`.
+     `browser_evaluate` is read-only diagnostics only. Do not use
+     `browser_run_code_unsafe`, do not modify the DOM, and do not click
+     through JavaScript. After form operations, do one cheap DOM check. Then
+     Connect / Authorize.
      Only then run `c2c pair --json` and type that code. As soon as it shows
      Connected / authorized / pairing accepted, continue — do NOT wait for 8
      tools on this page.
 6. Same tab: open the first C2C chat per **Conversation management**
    (Project collection for a new workspace; `https://chatgpt.com/` only
-   in long-chat). Confirm Chat mode per **In-app browser** §7 (if it is Work,
-   open a new Chat conversation instead). Send the boot prompt from
+   in long-chat). Confirm Chat mode per **Browser control** §7. If it is Work,
+   stop browser automation and ask the user to switch the C2C page to Chat;
+   after confirmation, re-run preflight. Never auto-switch Work → Chat and
+   never send HANDOFF to Work. Send the boot prompt from
    `docs/protocol.md` §Boot Prompt, then (same chat) send:
    `Use the "<connectorName>" connector: call workspace_info and read hello-style top-level file. Reply with the workspace name.`
-   Confirm the reply matches `workspaceName` (wait per **In-app browser** §8).
+   Confirm the reply matches `workspaceName` (wait per **Browser control** §8).
    Only then save the chat URL with `c2c session set` (see Conversation
-   management). If the name does not match, do not save. markDeliverable.
+   management). If the name does not match, do not save. Leave the tab open as standby.
 7. Report to the user exactly in this shape (no internals):
 
 ```
@@ -383,7 +591,7 @@ Project sources. Never click 分享 / Share. Do not rename ChatGPT chats.
 ONE ChatGPT conversation per workspace. Same as before.
 
 - **Find it**: if `conversation.reuseSavedChat` and `conversation.chatUrl`,
-  `goto` that URL (foreground + markHandoff) and continue there.
+  navigate to that URL and continue there.
 - **Save it**: after boot + workspace_info, and the reply names this workspace,
   `c2c session set -w <ws> --mode long-chat --url <url> --title "C2C <workspace name>"`.
   If the name does not match, do not overwrite a previously saved URL.
@@ -392,10 +600,13 @@ ONE ChatGPT conversation per workspace. Same as before.
   plus checkpoint flags from the coding workflow (`--protocol-state`,
   `--waiting-for`, `--goal`, `--next-step`, `--known-issues`, or
   `--clear-checkpoint` on DONE). Do not put logs or diffs in those fields.
-- **Switch it** ONLY when (a) the user asks for a new chat, (b) the current
-  chat visibly lags, or (c) this conversation is Work. Then:
-  1. Same iab tab: `goto` `https://chatgpt.com/`, confirm Chat mode
-     (**In-app browser** §7), then send the boot prompt.
+- **Switch it** ONLY when (a) the user asks for a new chat or (b) the current
+  chat visibly lags. If the current conversation is Work, do not switch
+  automatically: stop browser automation, tell the user to switch that page to
+  Chat, and rerun preflight after confirmation. Never send HANDOFF to Work.
+  Then:
+  1. Same managed tab: navigate to `https://chatgpt.com/`, confirm Chat mode
+     (**Browser control** §7), then send the boot prompt.
   2. Send a HANDOFF (`docs/protocol.md`) — goal, progress, state, issues,
      next step. Never paste files.
   3. workspace_info check; only then `c2c session set --url`. On failure,
@@ -410,7 +621,7 @@ ONE ChatGPT conversation per workspace. Same as before.
 One ChatGPT Project per workspace. Mapping:
 
 1. Same Codex conversation (this thread still has context) → same ChatGPT
-   chat URL. `goto` that URL directly. Do not open the collection first.
+   chat URL. navigate to that URL directly. Do not open the collection first.
 2. Same workspace, a **new** Codex conversation → new ChatGPT chat from the
    collection page (`conversation.projectUrl`). Ignore `session.url` unless
    you already saved it earlier in THIS Codex thread.
@@ -419,11 +630,11 @@ One ChatGPT Project per workspace. Mapping:
 **Open a chat in this Codex thread**
 
 - If you already saved a ChatGPT chat URL earlier in THIS Codex conversation:
-  `goto` that URL. Continue. No new chat. No HANDOFF.
-- Else if `conversation.projectReady`: `goto` `conversation.projectUrl`.
+  navigate to that URL. Continue. No new chat. No HANDOFF.
+- Else if `conversation.projectReady`: navigate to `conversation.projectUrl`.
   On that page, use the on-page composer (「{项目名}中的新聊天」 / "New chat
-  in …"). Do not use the sidebar and do not `goto` `https://chatgpt.com/`.
-  Confirm Chat mode (**In-app browser** §7). Boot prompt, then workspace_info
+  in …"). Do not use the sidebar and do not navigate to `https://chatgpt.com/`.
+  Confirm Chat mode (**Browser control** §7). Boot prompt, then workspace_info
   with the **exact** `connectorName`. After the reply names this workspace,
   `c2c session set -w <ws> --mode project --project-url <collection> --url <chat> --connector-name "<connectorName>" --title "C2C <workspace name>"`.
   If this Codex thread is continuing a previous C2C task, send HANDOFF right
@@ -438,7 +649,7 @@ Also offer「继续用长对话」. If they pick long-chat:
 `c2c session set -w <ws> --mode long-chat` and use the long-chat path.
 If the collection 404s or the new chat is not inside the Project, same choice.
 
-**Saved chat 404s** (this thread): `goto` the collection, open a new chat
+**Saved chat 404s** (this thread): navigate to the collection, open a new chat
 there, boot + HANDOFF from `session.checkpoint` (no logs) + workspace_info,
 then save the new chat URL. Keep `--project-url`.
 
@@ -446,7 +657,7 @@ then save the new chat URL. Keep `--project-url`.
 
 Do this for a new workspace, or when an existing user asks to switch to
 Project. Do **not** click the ChatGPT sidebar to create the Project
-(Computer Use is forbidden; IAB must not hunt that menu).
+(Computer Use is forbidden; the Playwright browser must not hunt that menu).
 
 1. Tell the user exactly this (fill in the workspace name):
 
@@ -458,7 +669,7 @@ Project. Do **not** click the ChatGPT sidebar to create the Project
 建好后会打开合集页面。看到页面后跟我说「好了」。
 ```
 
-2. Wait for「好了」/ the collection page. Same iab tab: read the address bar.
+2. Wait for「好了」/ the collection page. Same managed tab: read the address bar.
    It must look like `https://chatgpt.com/g/g-p-…/project`. If it does not,
    ask them to open that project until it does. Then:
    `c2c session set -w <ws> --mode project --project-url <url> --connector-name "<connectorName>"`.
@@ -527,17 +738,17 @@ ChatGPT's replies are expected to be substantive (see step 3). Docs: `docs/proto
    reclaim**, then doctor again and only continue when the gate is green.
    Generate task id: `c2c_` + 4 random hex chars — unless a checkpoint already
    has one (reuse that id; do not mint a second task).
-1. `c2c session -w <workspace> --json`. Open ChatGPT on the same iab tab
-   per **Conversation management** for `conversation.mode` (foreground +
-   markHandoff). long-chat: saved chat, or `https://chatgpt.com/` if none.
+1. `c2c session -w <workspace> --json`. Open ChatGPT on the same managed tab
+   per **Conversation management** for `conversation.mode`. long-chat: saved
+   chat, or `https://chatgpt.com/` if none.
    project: this thread's chat URL, or the collection page for a new chat,
    or **Bind Project** if `projectReady` is false. On a NEW conversation
-   confirm Chat mode (**In-app browser** §7), then send the boot prompt from
+   confirm Chat mode (**Browser control** §7), then send the boot prompt from
    `docs/protocol.md` §Boot Prompt and the workspace_info check (name the
    exact `connectorName`). Confirm the reply names the current workspace
    before saving the session URL. Do not use the browser to re-read code MCP
    already provides. After sending a control message, wait per
-   **In-app browser** §8.
+   **Browser control** §8.
 
    **Resume from `session.checkpoint` before any INIT.** Missing checkpoint
    (legacy session): continue as a normal new/continued loop. A browser/js
@@ -574,13 +785,13 @@ Produce a C2C PLAN message.
 ```
 
    Confirm the INIT message is visibly in that ChatGPT conversation (one cheap
-   DOM check). If the page is Retry-only, recover per **In-app browser** §7
+   DOM check). If the page is Retry-only, recover per **Browser control** §7
    first. Do not write the waiting checkpoint, and do not wait for PLAN, until
    that message is visible.
    Then:
    `c2c session set -w <ws> --task <id> --iteration 0 --state INIT --protocol-state INIT --waiting-for GPT_PLAN --goal "<short goal>" --next-step "wait for PLAN"`
-3. Wait for ChatGPT's `STATE: PLAN` reply (**In-app browser** §8 — short DOM
-   checks, same tab; do not treat a 5-minute browser timeout as failure).
+3. Wait for ChatGPT's `STATE: PLAN` reply (**Browser control** §8 — short DOM
+   checks, same tab; do not treat a browser timeout as failure).
    Read GOAL/ACTIONS/TESTS/SUCCESS_CRITERIA.
    A good PLAN also carries RATIONALE and concrete natural-language edit
    suggestions (which file, what to change, why). If the reply is a bare
@@ -641,8 +852,8 @@ If status is restricted, ignore it and review from git_diff.
 ## Workflow: disconnect（"断开 ChatGPT"）
 
 1. `c2c unpair -w <workspace>` (revokes all tokens immediately).
-2. Optionally remove the connector on the same iab tab via
-   `https://chatgpt.com/plugins` (foreground + markHandoff). Only touch
+2. Optionally remove the connector on the same managed tab via
+   `https://chatgpt.com/plugins`. Only touch
    this workspace's `connectorName`.
 3. Tell the user: "已断开 ChatGPT 对该项目的访问。"
 
@@ -661,7 +872,7 @@ the previous public address is gone. Doctor already started a new one.
    follow-up doctor is green. Never "try a message first to see if it works".
    Reuse `c2c prefs --json`. Do not re-ask setup mode. If `setupMode` is
    `manual`, use **Guided manual ChatGPT setup** (chosen) instead of automating.
-2. Same one iab tab as setup (foreground + markHandoff). Settings URLs only
+2. Same managed tab as setup. Settings URLs only
    until Connected — never hunt menus:
    - 开发人员模式: skip `https://chatgpt.com/#settings/Security` when
      `developerModeEnabled` is true. If create/delete then says developer
@@ -674,7 +885,7 @@ the previous public address is gone. Doctor already started a new one.
      delete if ChatGPT asks. **Never click Reconnect, Refresh, Connect, or
      Edit** on the old card — the old Server URL is dead and the page will
      hang on "This site cannot be reached".
-   - Then `goto` the 加插件 URL and create that **same** `connectorName`
+   - Then navigate to the 加插件 URL and create that **same** `connectorName`
      (do not invent a second name):
       - Description: `Securely connect ChatGPT to the current Codex workspace for planning and review.`
       - Server URL: `chatgptRepair.mcpUrl`
@@ -719,7 +930,7 @@ the previous public address is gone. Doctor already started a new one.
 | --- | --- |
 | Bridge not running | `c2c start` (doctor does this automatically) |
 | Tunnel dead / URL unreachable / 全关掉后连接失效 | `c2c doctor` → if `namedRepair.needed`, login to Cloudflare and doctor again (do not Delete). If `chatgptRepair.needed`, tell the user the message, then **Delete** THIS workspace's connector only (`connectorName`) and create it again. Never Reconnect. After recreate, re-check `workspace_info` in the saved chat; if it still fails, new chat in the same Project (or long-chat switch) + HANDOFF. |
-| Collection page shows only Retry | Same iab tab: Retry once, then open the last working chat and click its Project link. Do not write INIT/EXECUTED waiting checkpoints until the message is visible. |
+| Collection page shows only Retry | Same managed tab: Retry once, then open the last working chat and click its Project link. Do not write INIT/EXECUTED waiting checkpoints until the message is visible. |
 | ChatGPT says tool call failed / 401 | token expired or revoked → re-pair (new pairing code + authorize) |
 | Pairing code rejected/expired | `c2c pair --json` for a fresh code |
 | Same explicit ChatGPT setup/reconnect browser configuration step fails twice after repair | Stop automating ChatGPT settings and use **Guided manual ChatGPT setup fallback**. Do not count browser/js timeout, loading/generating, or login/2FA waiting as failures. |

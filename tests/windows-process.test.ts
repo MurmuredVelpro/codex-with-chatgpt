@@ -96,11 +96,9 @@ describe("Windows background subprocess windowsHide: true (RED verification)", (
     expect(provisionCall?.options).toHaveProperty("windowsHide", true);
   });
 
-  it("6. src/cli/index.ts update-check runGit passes windowsHide: true", () => {
-    const cliSource = fs.readFileSync(path.resolve("src/cli/index.ts"), "utf8");
-    // Verify runGit under update-check in cli/index.ts includes windowsHide: true
-    const updateCheckSection = cliSource.slice(cliSource.indexOf("// ---------------------------------------------------------------- update-check"));
-    const runGitSnippet = updateCheckSection.slice(0, updateCheckSection.indexOf("program"));
-    expect(runGitSnippet).toContain("windowsHide: true");
+  it("6. src/update/check.ts update-check git calls pass windowsHide: true", () => {
+    const source = fs.readFileSync(path.resolve("src/update/check.ts"), "utf8");
+    expect(source).toContain("windowsHide: true");
+    expect(source).toContain("GIT_TERMINAL_PROMPT");
   });
 });
